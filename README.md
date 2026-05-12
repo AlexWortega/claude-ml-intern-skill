@@ -34,7 +34,9 @@ For any ML task the skill:
 4. Implements `model.py` + `train.py` with smoke test + NaN guard
 5. Trains; logs `step=N loss=X` per step to `train.log`
 6. Saves `ckpt.pt` and writes `RESULTS.md`
-7. Notifies Telegram + Slack at every milestone
+7. **Self-verifies** via `VERIFY.md` — generation sanity, loss-vs-baseline, eval-tracks-train, data consumption, stderr scan, param-count drift. A low loss alone never declares success.
+8. **Pushes to HF Hub** — `model.safetensors` + `config.json` + `model.py` + the full reproducibility bundle (train logs, gen samples, VERIFY, RESEARCH) at `<user>/ml-intern-<slug>-<stamp>`. URL written to `PUBLISHED.md`.
+9. Notifies Telegram + Slack at every milestone (`plan_ready`, `code_ready`, `train_started`, `train_done`, `published`, `error`, `blocker`).
 
 All artifacts go under `~/ml-intern-runs/<slug>/`.
 

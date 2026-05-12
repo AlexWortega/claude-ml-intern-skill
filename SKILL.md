@@ -1,6 +1,6 @@
 ---
 name: ml-intern
-description: Autonomously research, implement, train and ship ML code using the Hugging Face ecosystem. Port of huggingface/ml-intern as a Claude Code skill. Triggers when the user asks to implement, train, fine-tune, or reproduce an ML model / paper / dataset workflow (e.g. "implement DeepSeek-V3 at 100M", "fine-tune Qwen on dataset X", "reproduce paper Y"). Emits Telegram + Slack milestone alerts via scripts/notify.sh.
+description: Autonomously research, implement, train and ship ML code using the Hugging Face ecosystem. Port of huggingface/ml-intern as a Claude Code skill. Triggers when the user asks to implement, train, fine-tune, or reproduce an ML model / paper / dataset workflow (e.g. "implement DeepSeek-V3 at 100M", "fine-tune Qwen on dataset X", "reproduce paper Y"). HF-native: pulls datasets/models/papers from the Hub, pushes trained checkpoints + run logs back to the Hub. Emits Telegram + Slack milestone alerts via scripts/notify.sh.
 ---
 
 # ml-intern — Claude Code skill
@@ -123,6 +123,90 @@ VERDICT: pass | fail
 
 Adapt the list for non-LM tasks (classifier → confusion matrix on held-out, regression → residuals plot, etc.). The shape stays the same: **read the artifact you produced, write down what it says, judge against an absolute baseline, fail loudly when something doesn't add up.**
 
+## Publishing to HF Hub (runs after VERIFY all-pass)
+
+Every successful run **must** be pushed to the HF Hub so it's reproducible by others. This is non-optional: a model on disk only is not "shipped".
+
+Trigger order: `VERIFY.md` all-pass → push → fire `published` notification → fire `train_done`.
+
+### What gets pushed
+
+A **model** repo (one per run) at `{$HF_USER or huggingface-cli whoami}/ml-intern-<slug>-<YYYYMMDD-HHMM>`, containing:
+- `model.py` — the architecture code (must be self-contained or import only stdlib + torch + transformers).
+- `config.json` — produced from your `<Model>Config` dataclass via `dataclasses.asdict(cfg)`, with `"_model_class": "<ClassName>"` added.
+- `model.safetensors` — convert `ckpts/best.pt` (or final) to safetensors. Use `safetensors.torch.save_file(state_dict, "model.safetensors")` where `state_dict = torch.load("ckpts/best.pt", map_location="cpu", weights_only=False)["model"]`.
+- `tokenizer.json` / `tokenizer_config.json` — if you used a HF tokenizer, save with `tokenizer.save_pretrained(".")`.
+- `README.md` — model card (template below).
+- `RESULTS.md`, `VERIFY.md`, `TASK.md`, `PLAN.md`, `RESEARCH.md`, `gen_samples.log`, `train.log`, `eval.log`, `DEBUG.md` if present — the full reproducibility bundle. (Not `train.stdout`/`train.stderr` — too noisy.)
+
+### How to push
+
+Use `scripts/hf_push.sh`:
+```
+bash $CLAUDE_SKILL_DIR/scripts/hf_push.sh <run-dir> <slug>
+```
+The script:
+- Reads `HF_TOKEN` from env / `.env` (fails fast with a clear message if absent).
+- Calls `huggingface-cli whoami` to resolve the namespace.
+- Creates the repo with `huggingface_hub.create_repo(..., exist_ok=True, repo_type="model")`.
+- Converts `ckpts/best.pt` (or `ckpts/step_<final>.pt`) → `model.safetensors` in a temp dir.
+- Generates the model card (sees `RESULTS.md` to fill metrics).
+- Uploads the whole staging dir with `huggingface_hub.upload_folder(...)`.
+- Prints the resulting URL to stdout. Capture it and write it to `PUBLISHED.md`.
+
+### Model card template (the script generates this from RESULTS.md if missing)
+
+```markdown
+---
+library_name: transformers
+tags:
+- ml-intern
+- pretraining
+- <architecture-family>
+datasets:
+- <hf-dataset-slug>
+license: apache-2.0
+---
+
+# <Model name> — <param count>
+
+Trained autonomously by [ml-intern](https://github.com/AlexWortega/claude-ml-intern-skill) on `<HOST>`.
+
+## Run summary
+
+| key | value |
+|---|---|
+| param_count | … |
+| dataset | … |
+| init_loss | … |
+| final_loss | … |
+| best_eval_loss | … |
+| wall_clock_hours | … |
+| hardware | … |
+
+## Generation sample
+
+> <one gen_samples.log line, verbatim>
+
+## Reproducibility
+
+`model.py`, `train.py`, full `train.log`, and `VERIFY.md` are bundled in this repo.
+
+## Caveats
+
+<copy "deviations vs plan" from RESULTS.md>
+```
+
+### Optional: dataset repo for the run log
+
+For runs where the gen_samples / train log are interesting beyond just one model (e.g. an ablation series), additionally push a **dataset** repo at `<HF_USER>/ml-intern-runs-<slug>` with `train.log`, `eval.log`, `gen_samples.log`, `session.jsonl` (the Claude session trace — mirrors what upstream ml-intern does to its private trace dataset). This is optional; only do it when the user asks or when running an ablation matrix.
+
+### Failure modes
+
+- No `HF_TOKEN` → fire `blocker` with "set HF_TOKEN in ~/.claude/skills/ml-intern/.env" and stop. Don't push to anon.
+- Repo name already taken by another run → append `-2`, `-3`, etc. until create_repo succeeds.
+- Upload timeout → retry once with `huggingface_hub.upload_large_folder`. If it fails again, fire `error` with the URL of the empty/partial repo.
+
 ## Done conditions
 
 A run is **done** when:
@@ -130,6 +214,8 @@ A run is **done** when:
 - `train.log` has the requested number of steps with finite loss.
 - `RESULTS.md` exists.
 - **`VERIFY.md` exists and every section verdict is `pass`.**
-- `notify.sh train_done` was fired.
+- **`PUBLISHED.md` exists with the HF Hub repo URL.**
+- `notify.sh published "<url>"` fired.
+- `notify.sh train_done "<final_loss> @ <url>"` fired.
 
 If any of these fail, the run is **not** done — fire `error` with the failing verdict copied in the message, and stop. Do not fire `train_done` on a broken run.

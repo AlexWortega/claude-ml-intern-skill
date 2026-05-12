@@ -77,12 +77,59 @@ from accelerate import Accelerator
 
 If the task mentions DeepSeek-V3 / V4 / MLA / DeepSeekMoE: read `assets/deepseek_v3_100m_blueprint.md` from this skill folder first — it has the sizing for a ~100M down-scale (vocab, d_model, MLA ranks, MoE expert count, RoPE config, training hyperparams).
 
+## Self-verification (MUST pass before declaring done)
+
+A low loss number is **not** evidence the model works. Multiple bugs (label off-by-one, causal mask leak, EOS-only batches, stream replay) produce a loss-vs-step curve that looks perfect while the model has learned nothing useful. Before firing `train_done`, run the full self-verification below and write the results to `VERIFY.md`. If any check fails, fire `error` (not `train_done`) and stop.
+
+For generative LMs (the common case):
+
+1. **Generation sanity** — from the final ckpt, generate 100 tokens from each of: `"Once upon a time,"`, `"The"`, `""` (empty / EOS). Output must be *recognizable language for the training distribution* — TinyStories-trained models produce simple coherent sentences after a few thousand steps. Word salad with valid vocabulary is a fail, not a partial pass.
+2. **Loss-vs-baseline sanity** — final loss must be **plausible**: above the trivial floor of ~`log(vocab) * 0.1`, below the uniform-distribution loss `log(vocab)`. For TinyStories @ gpt2 vocab (50257) on a 100M model: realistic train loss after 10k steps is roughly 1.5–3.0. Loss under 1.0 on a real LM task is a red flag — verify with generation before trusting it.
+3. **Eval tracks train** — `|eval_loss - train_loss| < 0.5` at the final checkpoint. A large gap in either direction usually means train/eval splits leaked or the eval pipeline is different.
+4. **Stream/data consumption matches plan** — if you planned N tokens and consumed <70% of N because the iterator exhausted, that's not "done", that's a data-pipeline bug. Document and fix or stop.
+5. **No silent fallback** — grep `train.stderr` for `Traceback`, `RuntimeError`, `Warning`, `trust_remote_code`, `Stopping ... dataloader workers`. Anything found must be explained in `VERIFY.md` (benign or addressed). Repeated warnings about dataloader workers or trust_remote_code mean the dataset is being retried on errors — investigate.
+6. **Param count matches design** — reported param count within ±15% of the target. A 30% drift means a layer is missing or duplicated.
+
+Layout of `VERIFY.md`:
+```
+## Generation samples
+PROMPT: "Once upon a time,"
+OUTPUT: <verbatim>
+VERDICT: pass | fail — <one-line reason>
+
+## Loss sanity
+final_train_loss = X
+final_eval_loss  = Y
+plausible range  = [A, B]
+VERDICT: pass | fail
+
+## Eval tracks train
+|eval - train| = Z
+VERDICT: pass | fail
+
+## Data consumption
+planned_tokens = N
+consumed_tokens = M  (M/N = K%)
+VERDICT: pass | fail
+
+## Stderr scan
+<grep results, one line each or "clean">
+VERDICT: pass | fail
+
+## Param count
+target = T  actual = A  drift = D%
+VERDICT: pass | fail
+```
+
+Adapt the list for non-LM tasks (classifier → confusion matrix on held-out, regression → residuals plot, etc.). The shape stays the same: **read the artifact you produced, write down what it says, judge against an absolute baseline, fail loudly when something doesn't add up.**
+
 ## Done conditions
 
 A run is **done** when:
 - Smoke-test forward pass succeeded (printed output shape + param count).
 - `train.log` has the requested number of steps with finite loss.
 - `RESULTS.md` exists.
+- **`VERIFY.md` exists and every section verdict is `pass`.**
 - `notify.sh train_done` was fired.
 
-If any of these fail, the run is **not** done — fix or report `blocker`.
+If any of these fail, the run is **not** done — fire `error` with the failing verdict copied in the message, and stop. Do not fire `train_done` on a broken run.

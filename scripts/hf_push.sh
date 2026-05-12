@@ -46,6 +46,7 @@ trap 'rm -rf "$stage"' EXIT
 # Build staging dir (model.safetensors, config.json, model.py, reproducibility bundle, README.md).
 # Pass shell args into Python via positional argv; use a quoted heredoc so $ and backticks are literal.
 ML_RUN_DIR="$run_dir" ML_STAGE="$stage" ML_SLUG="$slug" ML_HF_USER="$HF_USER" \
+ML_SCRIPT_DIR="$script_dir" ML_TOKENIZER="${ML_TOKENIZER:-gpt2}" ML_PROMPT="${ML_PROMPT:-Once upon a time,}" \
 python3 - <<'PYEOF'
 import os, json, glob, dataclasses
 from pathlib import Path
@@ -150,20 +151,39 @@ card_md = (
     "The full source (model.py, training script, train.log, eval.log, VERIFY.md, RESEARCH.md, DEBUG.md, gen_samples.log) is bundled in this repo.\n"
 )
 (stage / "README.md").write_text(card_md)
+
+# Templated load_test.py — substitute REPO, MODEL_CLASS, TOKENIZER, PROMPT
+import os as _os
+script_dir = Path(_os.environ.get("ML_SCRIPT_DIR", str(Path(__file__).parent if "__file__" in dir() else ".")))
+tpl_path = script_dir / "load_test.py.tpl"
+if tpl_path.exists() and model_class_name:
+    tok_guess = "gpt2"  # safe default; the skill should override via env when known
+    prompt_guess = "Once upon a time,"
+    body = tpl_path.read_text() \
+        .replace("__REPO__", f"{hf_user}/__REPO_FULL__") \
+        .replace("__MODEL_CLASS__", model_class_name) \
+        .replace("__TOKENIZER__", _os.environ.get("ML_TOKENIZER", tok_guess)) \
+        .replace("__PROMPT__", _os.environ.get("ML_PROMPT", prompt_guess))
+    # __REPO_FULL__ stays as a placeholder; it's stamped to the real repo name
+    # AFTER create_repo succeeds (which may pick a -2 / -3 suffix on collisions).
+    (stage / "load_test.py").write_text(body)
+    print("hf_push: staged load_test.py", flush=True)
+
 print("hf_push: stage ready", flush=True)
 PYEOF
 
 [ $? -eq 0 ] || { echo "hf_push: staging failed" >&2; exit 7; }
 
-# Create repo + upload.
+# Create repo + (re-stamp load_test.py with the real repo id) + upload.
 out=$(ML_BASE="$base_repo" ML_STAGE="$stage" python3 - <<'PYEOF'
 import os, sys
+from pathlib import Path
 from huggingface_hub import HfApi, create_repo, upload_folder
 
 token = os.environ["HF_TOKEN"]
-base = os.environ["ML_BASE"]
-stage = os.environ["ML_STAGE"]
-api = HfApi(token=token)
+base  = os.environ["ML_BASE"]
+stage = Path(os.environ["ML_STAGE"])
+api   = HfApi(token=token)
 repo_id = base
 for suffix in ["", "-2", "-3", "-4", "-5"]:
     cand = base + suffix
@@ -176,13 +196,19 @@ for suffix in ["", "-2", "-3", "-4", "-5"]:
         if "already created this model repo" in msg or "You already created" in msg or "409" in msg:
             continue
         raise
+
+# stamp the real repo id into load_test.py (placeholder __REPO_FULL__)
+lt = stage / "load_test.py"
+if lt.exists():
+    lt.write_text(lt.read_text().replace("__REPO_FULL__", repo_id.split("/", 1)[-1]))
+
 try:
-    upload_folder(folder_path=stage, repo_id=repo_id, repo_type="model",
+    upload_folder(folder_path=str(stage), repo_id=repo_id, repo_type="model",
                   commit_message="ml-intern: initial upload", token=token)
 except Exception as e:
     print(f"upload_folder failed, retrying with upload_large_folder: {e}", file=sys.stderr, flush=True)
     try:
-        api.upload_large_folder(folder_path=stage, repo_id=repo_id, repo_type="model")
+        api.upload_large_folder(folder_path=str(stage), repo_id=repo_id, repo_type="model")
     except Exception as e2:
         print(f"upload_large_folder also failed: {e2}", file=sys.stderr, flush=True)
         raise

@@ -138,6 +138,7 @@ A **model** repo (one per run) at `{$HF_USER or huggingface-cli whoami}/ml-inter
 - `tokenizer.json` / `tokenizer_config.json` — if you used a HF tokenizer, save with `tokenizer.save_pretrained(".")`.
 - `README.md` — model card (template below).
 - `RESULTS.md`, `VERIFY.md`, `TASK.md`, `PLAN.md`, `RESEARCH.md`, `gen_samples.log`, `train.log`, `eval.log`, `DEBUG.md` if present — the full reproducibility bundle. (Not `train.stdout`/`train.stderr` — too noisy.)
+- `load_test.py` — generated from `scripts/load_test.py.tpl` with the real repo id, model class, tokenizer and prompt baked in. Anyone with the repo URL can run `python load_test.py` and get a printable forward-pass + generation in one shot. Pass `ML_TOKENIZER=<hf-id>` and `ML_PROMPT="<text>"` to `hf_push.sh` to override the defaults.
 
 ### How to push
 

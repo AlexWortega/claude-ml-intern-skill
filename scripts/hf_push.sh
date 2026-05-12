@@ -20,14 +20,17 @@ env_file="$(dirname "$script_dir")/.env"
 [ -f "$env_file" ] && { set -a; . "$env_file"; set +a; }
 
 if [ -z "${HF_TOKEN:-}" ]; then
-  echo "hf_push: HF_TOKEN not set (env or $env_file). Aborting." >&2
+  # fallback to cached cli token
+  [ -f "$HOME/.cache/huggingface/token" ] && HF_TOKEN=$(cat "$HOME/.cache/huggingface/token")
+fi
+if [ -z "${HF_TOKEN:-}" ]; then
+  echo "hf_push: HF_TOKEN not set (env, $env_file, or huggingface-cli login). Aborting." >&2
   exit 3
 fi
 export HF_TOKEN
 
-# resolve user
 if [ -z "${HF_USER:-}" ]; then
-  HF_USER=$(python3 -c "from huggingface_hub import HfApi; print(HfApi(token='${HF_TOKEN}').whoami()['name'])" 2>/dev/null || true)
+  HF_USER=$(HF_TOKEN_FOR_PY="$HF_TOKEN" python3 -c "import os; from huggingface_hub import HfApi; print(HfApi(token=os.environ['HF_TOKEN_FOR_PY']).whoami()['name'])" 2>/dev/null || true)
 fi
 if [ -z "${HF_USER:-}" ]; then
   echo "hf_push: could not resolve HF user. Set HF_USER or fix HF_TOKEN." >&2
@@ -37,14 +40,21 @@ fi
 stamp=$(date +%Y%m%d-%H%M)
 base_repo="${HF_USER}/ml-intern-${slug}-${stamp}"
 
-# stage files in a temp dir
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 
-# Convert best (or final) ckpt -> safetensors
-python3 - <<PY
+# Build staging dir (model.safetensors, config.json, model.py, reproducibility bundle, README.md).
+# Pass shell args into Python via positional argv; use a quoted heredoc so $ and backticks are literal.
+ML_RUN_DIR="$run_dir" ML_STAGE="$stage" ML_SLUG="$slug" ML_HF_USER="$HF_USER" \
+python3 - <<'PYEOF'
 import os, json, glob, dataclasses
 from pathlib import Path
+
+run = Path(os.environ["ML_RUN_DIR"])
+stage = Path(os.environ["ML_STAGE"])
+slug = os.environ["ML_SLUG"]
+hf_user = os.environ["ML_HF_USER"]
+
 import torch
 try:
     from safetensors.torch import save_file
@@ -52,10 +62,7 @@ except Exception as e:
     print(f"hf_push: safetensors not installed: {e}", flush=True)
     raise SystemExit(5)
 
-run = Path("$run_dir")
-stage = Path("$stage")
-
-# pick ckpt: best > step_final > newest
+# pick ckpt: best per RESULTS.md > newest
 ckpts = sorted(glob.glob(str(run / "ckpts" / "*.pt")))
 if not ckpts:
     print("hf_push: no ckpts/*.pt found", flush=True); raise SystemExit(6)
@@ -73,109 +80,120 @@ print(f"hf_push: using ckpt {best}", flush=True)
 
 state = torch.load(best, map_location="cpu", weights_only=False)
 sd = state.get("model", state) if isinstance(state, dict) else state
-# strip any non-tensor keys
 sd = {k: v.contiguous() for k, v in sd.items() if hasattr(v, "shape")}
 save_file(sd, str(stage / "model.safetensors"))
 print(f"hf_push: wrote model.safetensors ({len(sd)} tensors)", flush=True)
 
-# config.json — try to find <Model>Config in model.py and serialize
 model_py = run / "model.py"
+model_class_name = None
 if model_py.exists():
     (stage / "model.py").write_text(model_py.read_text())
-    cfg_path = stage / "config.json"
     try:
-        import sys, importlib.util
+        import importlib.util
         spec = importlib.util.spec_from_file_location("_mlintern_model", str(model_py))
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         cfg_cls = next((getattr(mod, n) for n in dir(mod) if n.endswith("Config") and dataclasses.is_dataclass(getattr(mod, n))), None)
         if cfg_cls is not None:
             d = dataclasses.asdict(cfg_cls())
-            model_cls = next((n for n in dir(mod) if n != cfg_cls.__name__ and n.replace("Config","") in cfg_cls.__name__.replace("Config","")), None) or cfg_cls.__name__.replace("Config","")
-            d["_model_class"] = model_cls
-            cfg_path.write_text(json.dumps(d, indent=2, default=str))
-            print(f"hf_push: wrote config.json (class={model_cls})", flush=True)
+            model_class_name = cfg_cls.__name__.replace("Config", "")
+            d["_model_class"] = model_class_name
+            (stage / "config.json").write_text(json.dumps(d, indent=2, default=str))
+            print(f"hf_push: wrote config.json (class={model_class_name})", flush=True)
     except Exception as e:
         print(f"hf_push: could not synthesize config.json: {e}", flush=True)
 
-# copy reproducibility bundle
+# reproducibility bundle
 for name in ["RESULTS.md", "VERIFY.md", "TASK.md", "PLAN.md", "RESEARCH.md",
              "DEBUG.md", "gen_samples.log", "train.log", "eval.log",
              "train.py", "train_v2.py", "train_full.py", "generate.py"]:
     src = run / name
     if src.exists():
-        (stage / name).write_text(src.read_text(errors="replace"))
+        try:
+            (stage / name).write_text(src.read_text(errors="replace"))
+        except Exception:
+            pass
 
-# tokenizer if present
 for tk in ["tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "vocab.json", "merges.txt"]:
     src = run / tk
     if src.exists():
-        (stage / tk).write_text(src.read_text(errors="replace"))
+        try:
+            (stage / tk).write_text(src.read_text(errors="replace"))
+        except Exception:
+            pass
 
-# model card
-card = stage / "README.md"
-if not card.exists():
-    metrics = ""
-    if results.exists():
-        metrics = results.read_text()
-    gen = ""
-    gs = run / "gen_samples.log"
-    if gs.exists():
-        for line in gs.read_text().splitlines():
-            if line.startswith("OUTPUT:"):
-                gen = line[len("OUTPUT:"):].strip().strip("'\"")
-                break
-    card.write_text(f"""---
-library_name: transformers
-tags:
-- ml-intern
-- pretraining
-license: apache-2.0
----
+# generate model card
+metrics = results.read_text() if results.exists() else "(training still in progress — see train.log + eval.log)"
+gen = ""
+gs = run / "gen_samples.log"
+if gs.exists():
+    for line in gs.read_text().splitlines():
+        if line.startswith("OUTPUT:"):
+            gen = line[len("OUTPUT:"):].strip().strip("'\"")
+            break
 
-# ml-intern run: {slug}
-
-Trained autonomously by [ml-intern](https://github.com/AlexWortega/claude-ml-intern-skill).
-
-## Sample generation
-
-> {gen[:500] if gen else "(no gen sample found)"}
-
-## Run metrics
-
-{metrics if metrics else "(see RESULTS.md)"}
-
-## Reproducibility
-
-`model.py`, training scripts, full `train.log`, `VERIFY.md` are bundled in this repo.
-""")
+card_md = (
+    "---\n"
+    "library_name: transformers\n"
+    "tags:\n"
+    "- ml-intern\n"
+    "- pretraining\n"
+    "license: apache-2.0\n"
+    "---\n\n"
+    f"# ml-intern run: {slug}\n\n"
+    "Trained autonomously by the [ml-intern Claude Code skill](https://github.com/AlexWortega/claude-ml-intern-skill).\n\n"
+    "## Sample generation\n\n"
+    f"> {gen[:500] if gen else '(no gen sample found)'}\n\n"
+    "## Run metrics\n\n"
+    f"{metrics}\n\n"
+    "## Reproducibility\n\n"
+    "The full source (model.py, training script, train.log, eval.log, VERIFY.md, RESEARCH.md, DEBUG.md, gen_samples.log) is bundled in this repo.\n"
+)
+(stage / "README.md").write_text(card_md)
 print("hf_push: stage ready", flush=True)
-PY
+PYEOF
 
 [ $? -eq 0 ] || { echo "hf_push: staging failed" >&2; exit 7; }
 
-# create + upload via huggingface_hub
-out=$(python3 - <<PY
-from huggingface_hub import HfApi, create_repo
-api = HfApi(token="$HF_TOKEN")
-base = "$base_repo"
+# Create repo + upload.
+out=$(ML_BASE="$base_repo" ML_STAGE="$stage" python3 - <<'PYEOF'
+import os, sys
+from huggingface_hub import HfApi, create_repo, upload_folder
+
+token = os.environ["HF_TOKEN"]
+base = os.environ["ML_BASE"]
+stage = os.environ["ML_STAGE"]
+api = HfApi(token=token)
+repo_id = base
 for suffix in ["", "-2", "-3", "-4", "-5"]:
-    repo_id = base + suffix
+    cand = base + suffix
     try:
-        create_repo(repo_id, token="$HF_TOKEN", repo_type="model", private=False, exist_ok=False)
+        create_repo(cand, token=token, repo_type="model", private=False, exist_ok=False)
+        repo_id = cand
         break
     except Exception as e:
-        if "already created" in str(e) or "You already created" in str(e):
+        msg = str(e)
+        if "already created this model repo" in msg or "You already created" in msg or "409" in msg:
             continue
-        # else re-raise
+        raise
+try:
+    upload_folder(folder_path=stage, repo_id=repo_id, repo_type="model",
+                  commit_message="ml-intern: initial upload", token=token)
+except Exception as e:
+    print(f"upload_folder failed, retrying with upload_large_folder: {e}", file=sys.stderr, flush=True)
+    try:
+        api.upload_large_folder(folder_path=stage, repo_id=repo_id, repo_type="model")
+    except Exception as e2:
+        print(f"upload_large_folder also failed: {e2}", file=sys.stderr, flush=True)
         raise
 print(repo_id)
-try:
-    api.upload_folder(folder_path="$stage", repo_id=repo_id, repo_type="model", commit_message="ml-intern: initial upload")
-except Exception:
-    api.upload_large_folder(folder_path="$stage", repo_id=repo_id, repo_type="model")
-PY
-) || { echo "hf_push: upload failed" >&2; exit 8; }
+PYEOF
+)
+rc=$?
+if [ $rc -ne 0 ] || [ -z "$out" ]; then
+  echo "hf_push: upload failed" >&2
+  exit 8
+fi
 
 repo_id=$(echo "$out" | tail -1)
 url="https://huggingface.co/${repo_id}"
